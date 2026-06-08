@@ -183,6 +183,9 @@ async function launchPage(browser: Browser): Promise<Page> {
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 800 });
 
+  page.on("error", (err) => logger.error({ err }, "Page error"));
+  page.on("close", () => logger.info("Page closed"));
+
   const client: CDPSession = await page.createCDPSession();
   await client.send("Network.enable");
 
@@ -194,8 +197,15 @@ async function launchPage(browser: Browser): Promise<Page> {
     handleGameEvent(eventName, data);
   });
 
+  client.on("Target.targetCrashed", (event) => logger.error({ event }, "CDP target crashed"));
+
   logger.info({ url: RUGS_URL }, "Navigating to rugs.fun");
-  await page.goto(RUGS_URL, { waitUntil: "domcontentloaded", timeout: PAGE_TIMEOUT_MS });
+  try {
+    await page.goto(RUGS_URL, { waitUntil: "domcontentloaded", timeout: PAGE_TIMEOUT_MS });
+  } catch (err) {
+    logger.error({ err }, "Navigation to rugs.fun failed");
+    throw err;
+  }
   await new Promise((r) => setTimeout(r, 5_000));
   logger.info("Page ready — intercepting game events via CDP");
   return page;
@@ -223,7 +233,6 @@ export async function startMonitor(): Promise<void> {
         "--disable-background-timer-throttling",
         "--no-first-run",
         "--no-zygote",
-        "--single-process",
         "--mute-audio",
       ],
     });
