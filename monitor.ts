@@ -2,26 +2,16 @@
  * rugs.fun standard game monitor — Puppeteer WebSocket interception
  */
 
-import { execSync } from "node:child_process";
 import puppeteer, {
   type Browser,
   type Page,
   type CDPSession,
-} from "puppeteer-core";
+} from "puppeteer";
 import { logger } from "./logger";
 
 const RUGS_URL = "https://rugs.fun";
 const PAGE_TIMEOUT_MS = 25_000;
 const HEARTBEAT_MS = 30_000;
-
-function findChromium(): string {
-  if (process.env.CHROMIUM_PATH) return process.env.CHROMIUM_PATH;
-  try {
-    return execSync("which chromium", { encoding: "utf8" }).trim();
-  } catch {
-    throw new Error("Chromium not found. Set CHROMIUM_PATH or install chromium.");
-  }
-}
 
 async function sendWebhook(key: string, content: string): Promise<void> {
   const url = process.env[key];
@@ -212,8 +202,7 @@ async function launchPage(browser: Browser): Promise<Page> {
 }
 
 export async function startMonitor(): Promise<void> {
-  const chromiumPath = findChromium();
-  logger.info({ chromiumPath }, "Starting rugs.fun monitor (WS intercept mode)");
+  logger.info("Starting rugs.fun monitor (WS intercept mode)");
 
   let browser: Browser | null = null;
   let page: Page | null = null;
@@ -223,7 +212,6 @@ export async function startMonitor(): Promise<void> {
     try { if (browser) await browser.close().catch(() => {}); } catch {}
 
     browser = await puppeteer.launch({
-      executablePath: chromiumPath,
       headless: true,
       args: [
         "--no-sandbox",
