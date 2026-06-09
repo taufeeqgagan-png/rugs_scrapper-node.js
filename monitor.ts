@@ -12,6 +12,7 @@ import { logger } from "./logger";
 const RUGS_URL = "https://rugs.fun";
 const PAGE_TIMEOUT_MS = 25_000;
 const HEARTBEAT_MS = 30_000;
+const PAGE_REFRESH_MS = 8 * 60 * 1000; // refresh every 8 min before memory crash
 
 async function sendWebhook(key: string, content: string): Promise<void> {
   const url = process.env[key];
@@ -179,12 +180,19 @@ function parseSocketIOFrame(raw: string): [string, Record<string, unknown>] | nu
   return [eventName, dataArg as Record<string, unknown>];
 }
 
-async function launchPage(browser: Browser): Promise<Page> {
+async function launchPage(browser: Browser, onCrash: () => void): Promise<Page> {
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 800 });
 
-  page.on("error", (err) => logger.error({ err }, "Page error"));
-  page.on("close", () => logger.info("Page closed"));
+  // Trigger immediate restart on page crash or close
+  page.on("error", (err) => {
+    logger.error({ err }, "Page error — restarting");
+    onCrash();
+  });
+  page.on("close", () => {
+    logger.info("Page closed — restarting");
+    onCrash();
+  });
 
   const client: CDPSession = await page.createCDPSession();
   await client.send("Network.enable");
@@ -197,7 +205,10 @@ async function launchPage(browser: Browser): Promise<Page> {
     handleGameEvent(eventName, data);
   });
 
-  client.on("Target.targetCrashed", (event) => logger.error({ event }, "CDP target crashed"));
+  client.on("Target.targetCrashed", (event) => {
+    logger.error({ event }, "CDP target crashed — restarting");
+    onCrash();
+  });
 
   logger.info({ url: RUGS_URL }, "Navigating to rugs.fun");
   try {
@@ -216,10 +227,15 @@ export async function startMonitor(): Promise<void> {
 
   let browser: Browser | null = null;
   let page: Page | null = null;
+  let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let restarting = false;
 
   async function ensureBrowser(): Promise<void> {
-    if (browser && page) return;
+    // Clean up old browser
+    if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
     try { if (browser) await browser.close().catch(() => {}); } catch {}
+    browser = null;
+    page = null;
 
     browser = await puppeteer.launch({
       headless: true,
@@ -238,22 +254,62 @@ export async function startMonitor(): Promise<void> {
     });
 
     tracker = makeTracker();
+    restarting = false;
 
     browser.on("disconnected", () => {
-      logger.warn("Browser disconnected — will relaunch on next heartbeat");
+      logger.warn("Browser disconnected — will relaunch");
       browser = null;
       page = null;
+      scheduleRestart(3_000);
     });
 
-    page = await launchPage(browser);
+    const onCrash = () => scheduleRestart(3_000);
+
+    page = await launchPage(browser, onCrash);
+
+    // Proactively refresh every 8 min to prevent memory-induced crash
+    refreshTimer = setTimeout(() => {
+      logger.info("Proactive page refresh (8 min) — restarting browser");
+      scheduleRestart(0);
+    }, PAGE_REFRESH_MS);
   }
 
-  await ensureBrowser().catch((err) => logger.error({ err }, "Initial browser launch failed — will retry"));
+  function scheduleRestart(delayMs: number): void {
+    if (restarting) return;
+    restarting = true;
+    setTimeout(async () => {
+      try {
+        await ensureBrowser();
+        logger.info("Browser restarted successfully");
+      } catch (err) {
+        logger.error({ err }, "Browser restart failed — retrying in 10s");
+        restarting = false;
+        scheduleRestart(10_000);
+      }
+    }, delayMs);
+  }
 
+  await ensureBrowser().catch((err) => {
+    logger.error({ err }, "Initial browser launch failed — will retry");
+    scheduleRestart(10_000);
+  });
+
+  // Heartbeat
   setInterval(() => {
-    logger.info({ phase: tracker.phase, totalRounds, roundsSinceLong, roundsSince100x, roundsSinceInsta, lastGameId: tracker.lastGameId }, "Monitor alive");
-    if (!browser || !page) {
-      ensureBrowser().catch((err) => logger.error({ err }, "Browser relaunch failed"));
+    logger.info({
+      phase: tracker.phase,
+      totalRounds,
+      roundsSinceLong,
+      roundsSince100x,
+      roundsSinceInsta,
+      lastGameId: tracker.lastGameId,
+      browserAlive: !!browser,
+      pageAlive: !!page && !page.isClosed(),
+    }, "Monitor alive");
+
+    // Fallback: if browser/page silently died and no restart scheduled
+    if (!browser || !page || page.isClosed()) {
+      scheduleRestart(1_000);
     }
   }, HEARTBEAT_MS);
 }
