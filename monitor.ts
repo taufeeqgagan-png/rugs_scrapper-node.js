@@ -12,7 +12,7 @@ import { logger } from "./logger";
 const RUGS_URL = "https://rugs.fun";
 const PAGE_TIMEOUT_MS = 25_000;
 const HEARTBEAT_MS = 30_000;
-const PAGE_REFRESH_MS = 8 * 60 * 1000; // refresh every 8 min before memory crash
+const PAGE_REFRESH_MS = 4 * 60 * 1000; // refresh every 4 min before memory crash
 
 async function sendWebhook(key: string, content: string): Promise<void> {
   const url = process.env[key];
@@ -136,7 +136,7 @@ function handleGameEvent(eventName: string, data: Record<string, unknown>): void
 
         if (gameId) {
           tracker.processedIds.add(gameId);
-          if (tracker.processedIds.size > 500) {
+          if (tracker.processedIds.size > 100) {
             const first = tracker.processedIds.values().next().value;
             if (first !== undefined) tracker.processedIds.delete(first);
           }
@@ -233,9 +233,15 @@ export async function startMonitor(): Promise<void> {
   async function ensureBrowser(): Promise<void> {
     // Clean up old browser
     if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
+    try {
+      if (page && !page.isClosed()) await page.close().catch(() => {});
+    } catch {}
     try { if (browser) await browser.close().catch(() => {}); } catch {}
     browser = null;
     page = null;
+    tracker.processedIds.clear();
+    // Give the OS time to reclaim file descriptors and process slots
+    await new Promise((r) => setTimeout(r, 2_000));
 
     browser = await puppeteer.launch({
       headless: true,
@@ -247,6 +253,7 @@ export async function startMonitor(): Promise<void> {
         "--disable-software-rasterizer",
         "--disable-extensions",
         "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
         "--no-first-run",
         "--no-zygote",
         "--mute-audio",
@@ -267,12 +274,14 @@ export async function startMonitor(): Promise<void> {
 
     page = await launchPage(browser, onCrash);
 
-    // Proactively refresh every 8 min to prevent memory-induced crash
+    // Proactively refresh every 4 min to prevent memory-induced crash
     refreshTimer = setTimeout(() => {
-      logger.info("Proactive page refresh (8 min) — restarting browser");
+      logger.info("Proactive page refresh (4 min) — restarting browser");
       scheduleRestart(0);
     }, PAGE_REFRESH_MS);
   }
+
+  let restartFailures = 0;
 
   function scheduleRestart(delayMs: number): void {
     if (restarting) return;
@@ -281,10 +290,14 @@ export async function startMonitor(): Promise<void> {
       try {
         await ensureBrowser();
         logger.info("Browser restarted successfully");
+        restartFailures = 0;
       } catch (err) {
-        logger.error({ err }, "Browser restart failed — retrying in 10s");
+        restartFailures++;
+        // Exponential backoff: 30s on first failure, 60s on second+
+        const retryDelay = restartFailures === 1 ? 30_000 : 60_000;
+        logger.error({ err, restartFailures, retryDelay }, `Browser restart failed — retrying in ${retryDelay / 1000}s`);
         restarting = false;
-        scheduleRestart(10_000);
+        scheduleRestart(retryDelay);
       }
     }, delayMs);
   }
